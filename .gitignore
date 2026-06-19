@@ -1,0 +1,10 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.keras
+*.h5
+*.pt
+node_modules/
+.env
+*.log
