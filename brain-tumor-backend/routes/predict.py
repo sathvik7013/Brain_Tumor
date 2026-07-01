@@ -1,26 +1,73 @@
-from fastapi import APIRouter, File, UploadFile, HTTPException
-from PIL import Image
-import numpy as np
-import io, base64
-import cv2
-import tensorflow as tf
+from fastapi import APIRouter, File, UploadFile, HTTPException, Form
+import io, base64, json
 import traceback
+from pathlib import Path
+from datetime import datetime, timezone
 
-model = tf.keras.models.load_model("model/brain_tumor_model.keras")
+from db.database import predictions_collection
+
+MODEL_PATH = Path(__file__).resolve().parents[1] / "model" / "brain_tumor_model.keras"
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
 IMG_SIZE = (224, 224)
 GRADCAM_LAYER = "top_conv"
 
-print("Model loaded! Input shape:", model.input_shape)
-
 router = APIRouter()
+model = None
+tf = None
+Image = None
+np = None
+cv2 = None
+
+
+def load_ml_stack():
+    global model, tf, Image, np, cv2
+
+    if model is not None:
+        return model
+
+    try:
+        from PIL import Image as pil_image
+        import numpy as numpy
+        import cv2 as open_cv
+        import tensorflow as tensorflow
+
+        tf = tensorflow
+        Image = pil_image
+        np = numpy
+        cv2 = open_cv
+        model = tf.keras.models.load_model(MODEL_PATH)
+        print("Model loaded! Input shape:", model.input_shape)
+        return model
+    except Exception as exc:
+        raise RuntimeError(f"Model stack unavailable: {exc}") from exc
+
+
+def parse_patient(patient_payload):
+    if not patient_payload:
+        return {}
+    if isinstance(patient_payload, dict):
+        return patient_payload
+    try:
+        return json.loads(patient_payload)
+    except json.JSONDecodeError:
+        return {}
+
+
+async def save_prediction(record):
+    if predictions_collection is None:
+        return
+    try:
+        await predictions_collection.insert_one(record)
+    except Exception as exc:
+        print(f"Database save skipped: {exc}")
 
 
 def generate_gradcam(img_array, class_idx):
     try:
+        current_model = load_ml_stack()
         grad_model = tf.keras.Model(
-            inputs=model.input,
-            outputs=[model.get_layer(GRADCAM_LAYER).output, model.output]
+            inputs=current_model.input,
+            outputs=[current_model.get_layer(GRADCAM_LAYER).output, current_model.output]
         )
         with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_array)
@@ -54,9 +101,11 @@ def overlay_gradcam(original_img, heatmap):
 
 
 @router.post("/predict")
-async def predict(file: UploadFile = File(...)):
+async def predict(file: UploadFile = File(...), patient: str | None = Form(None)):
     try:
         print(f"Received: {file.filename}")
+        patient_data = parse_patient(patient)
+        current_model = load_ml_stack()
         contents = await file.read()
         original_img = Image.open(io.BytesIO(contents)).convert("RGB")
         img = original_img.resize(IMG_SIZE)
@@ -67,7 +116,7 @@ async def predict(file: UploadFile = File(...)):
 
         print(f"Input range: {img_array.min():.1f} to {img_array.max():.1f}")
 
-        predictions = model.predict(img_array)[0]
+        predictions = current_model.predict(img_array)[0]
         print(f"Predictions: {predictions}")
 
         predicted_class = CLASS_NAMES[np.argmax(predictions)]
@@ -84,18 +133,44 @@ async def predict(file: UploadFile = File(...)):
         heatmap = generate_gradcam(img_array, class_idx)
         gradcam_b64 = overlay_gradcam(original_img, heatmap) if heatmap is not None else None
 
+        record = {
+            "filename": file.filename,
+            "patient": patient_data,
+            "prediction": predicted_class,
+            "confidence": round(confidence * 100, 2),
+            "scores": scores,
+            "timestamp": datetime.now(timezone.utc),
+        }
+        await save_prediction(record)
+
         return {
             "prediction": predicted_class,
             "confidence": round(confidence * 100, 2),
             "scores": scores,
-            "gradcam": gradcam_b64
+            "gradcam": gradcam_b64,
+            "patient": patient_data,
+            "filename": file.filename,
         }
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e))
 
 
 @router.get("/history")
-async def get_history():
-    return []
+async def get_history(limit: int = 20):
+    try:
+        if predictions_collection is None:
+            return []
+        cursor = predictions_collection.find(
+            {},
+            {"_id": 1, "filename": 1, "patient": 1, "prediction": 1, "confidence": 1, "timestamp": 1}
+        ).sort("timestamp", -1).limit(limit)
+        records = await cursor.to_list(length=limit)
+        for record in records:
+            if record.get("timestamp") is not None:
+                record["timestamp"] = record["timestamp"].isoformat()
+        return records
+    except Exception as exc:
+        print(f"History fetch failed: {exc}")
+        return []
